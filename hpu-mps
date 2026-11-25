@@ -1,0 +1,452 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+#
+# hpu-mps -- CUDA-MPS-like multi-process launcher and controller for Gaudi2 HPU.
+#
+# Usage:
+#   hpu-mps start                           Start the Slot 0 primary daemon (and zero-prefix mode as root)
+#   hpu-mps stop [--force]                  Stop the primary daemon and zero-prefix mode
+#   hpu-mps status                          Show slot occupancy, HBM layout & zero-prefix mode
+#   hpu-mps top [-i <sec>] [--once|--json]  Live TUI / snapshot monitor (telemetry + per-slot processes)
+#   hpu-mps set-mem <slot> <GB>             Set default HBM quota (1..90 GB) for <slot> (0, 1, or 2)
+#   hpu-mps enable-global                   Enable zero-prefix execution via /etc/ld.so.preload (root)
+#   hpu-mps disable-global                  Disable zero-prefix execution (root)
+#   hpu-mps [options] [--] <cmd> [args...]  Run command on the shared Gaudi2 HPU
+#
+# Options:
+#   -s, --slot <0|1|2>          Explicitly request MPS slot 0, 1, or 2
+#   -m, --mem, --hbm-gb <GB>    Per-process HBM pool quota in GB (1..90, default: 36 with daemon / 24 otherwise)
+#   -q, --quiet                 Suppress [hpu-mps] diagnostic logs
+#
+# Environment:
+#   HPU_MPS_LIB_DIR    directory holding libhpu_mps.so, scal-xfer, and hpu-mps-top
+#   HPU_MPS_RUN_DIR    state directory (default /run/hpu-mps for root, $XDG_RUNTIME_DIR/hpu-mps otherwise)
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+
+find_lib_dir() {
+    local d
+    for d in "${HPU_MPS_LIB_DIR:-}" "${SCRIPT_DIR}/../lib/hpu-mps" "${SCRIPT_DIR}/build"; do
+        if [[ -n "$d" && -f "${d}/libhpu_mps.so" ]]; then
+            (cd "$d" && pwd)
+            return 0
+        fi
+    done
+    echo "[hpu-mps] ERROR: libhpu_mps.so not found; run 'make' or set HPU_MPS_LIB_DIR" >&2
+    return 1
+}
+
+LIB_DIR="$(find_lib_dir)"
+MPS_LIB="${LIB_DIR}/libhpu_mps.so"
+SCAL_XFER="${LIB_DIR}/scal-xfer"
+MPS_TOP="${LIB_DIR}/hpu-mps-top"
+
+if [[ -n "${HPU_MPS_RUN_DIR:-}" ]]; then
+    RUN_DIR="$HPU_MPS_RUN_DIR"
+elif (( EUID == 0 )); then
+    RUN_DIR="/run/hpu-mps"
+else
+    RUN_DIR="${XDG_RUNTIME_DIR:-/run/user/${EUID}}/hpu-mps"
+fi
+
+ensure_run_dir() {
+    if [[ ! -d "$RUN_DIR" ]]; then
+        (umask 077 && mkdir -p "$RUN_DIR")
+    fi
+    if [[ -L "$RUN_DIR" || ! -O "$RUN_DIR" || "$(stat -c %a "$RUN_DIR")" != "700" ]]; then
+        echo "[hpu-mps] ERROR: ${RUN_DIR} must be a directory owned by uid ${EUID} with mode 0700" >&2
+        exit 1
+    fi
+}
+
+DAEMON_PID_FILE="${RUN_DIR}/daemon.pid"
+DAEMON_LOG="${RUN_DIR}/daemon.log"
+READY_FILE="${RUN_DIR}/slot-0.ready"
+HBM_STATE_FILE="${RUN_DIR}/hbm.state"
+
+slot_lock_file() {
+    echo "${RUN_DIR}/slot-$1.lock"
+}
+
+# The interposer holds slot locks as OFD locks; look them up in /proc/locks
+# instead of probing, so a probe never makes a starting process lose its slot.
+slot_is_locked() {
+    local f dev ino key
+    f="$(slot_lock_file "$1")"
+    [[ -f "$f" ]] || return 1
+    read -r dev ino < <(stat -c '%d %i' "$f")
+    key="$(printf '%02x:%02x:%s' $(( (dev >> 8) & 0xfff )) $(( (dev & 0xff) | ((dev >> 12) & 0xfff00) )) "$ino")"
+    awk -v k="$key" '$2 == "OFDLCK" && $4 == "WRITE" && $6 == k { found = 1 } END { exit !found }' /proc/locks
+}
+
+slot_pid() {
+    local f
+    f="$(slot_lock_file "$1")"
+    if [[ -f "$f" ]]; then
+        head -n1 "$f" 2>/dev/null | tr -d '[:space:]'
+    fi
+}
+
+secondary_slots_active() {
+    slot_is_locked 1 || slot_is_locked 2
+}
+
+require_root() {
+    if (( EUID != 0 )); then
+        echo "[hpu-mps] ERROR: $1 requires root (it edits /etc/ld.so.preload)" >&2
+        exit 1
+    fi
+}
+
+is_global_preload_enabled() {
+    [[ -f /etc/ld.so.preload ]] && grep -Fxq "$MPS_LIB" /etc/ld.so.preload 2>/dev/null
+}
+
+enable_global_preload() {
+    require_root enable-global
+    if ! is_global_preload_enabled; then
+        echo "$MPS_LIB" >> /etc/ld.so.preload
+    fi
+}
+
+disable_global_preload() {
+    require_root disable-global
+    [[ -f /etc/ld.so.preload ]] || return 0
+    local tmp
+    tmp="$(mktemp /etc/.ld.so.preload.XXXXXX)"
+    grep -Fv "/libhpu_mps.so" /etc/ld.so.preload > "$tmp" || true
+    if [[ -s "$tmp" ]]; then
+        chmod 644 "$tmp"
+        mv "$tmp" /etc/ld.so.preload
+    else
+        rm -f "$tmp" /etc/ld.so.preload
+    fi
+}
+
+ensure_hbm_state_file() {
+    if [[ ! -f "$HBM_STATE_FILE" ]]; then
+        (umask 077 && printf '0 0 0x0 0x0 0 0\n1 0 0x0 0x0 0 0\n2 0 0x0 0x0 0 0\n' > "$HBM_STATE_FILE")
+    fi
+}
+
+parse_gb() {
+    local v="${1%GB}"
+    v="${v%G}"
+    v="${v%g}"
+    if [[ ! "$v" =~ ^[0-9]+$ ]] || (( 10#$v < 1 || 10#$v > 90 )); then
+        echo "[hpu-mps] ERROR: HBM quota must be 1..90 GB, got '$1'" >&2
+        exit 1
+    fi
+    echo $(( 10#$v ))
+}
+
+format_hbm_bytes() {
+    local raw="$1"
+    if [[ ! "$raw" =~ ^0x[0-9a-fA-F]+$ ]]; then
+        printf "?"
+        return
+    fi
+    local b=$(( raw ))
+    local mib=$(( b >> 20 ))
+    if (( mib % 1024 == 0 )); then
+        printf "%d GB" $(( mib / 1024 ))
+    elif (( mib % 512 == 0 )); then
+        printf "%d.5 GB" $(( mib / 1024 ))
+    else
+        printf "%d MB" "$mib"
+    fi
+}
+
+cmd_set_mem() {
+    local target_slot="${1:-}"
+    if [[ ! "$target_slot" =~ ^[012]$ ]]; then
+        echo "[hpu-mps] ERROR: usage: hpu-mps set-mem <0|1|2> <1..90>" >&2
+        exit 1
+    fi
+    local target_gb
+    target_gb="$(parse_gb "${2:-}")"
+    ensure_run_dir
+    ensure_hbm_state_file
+    # Same lock the interposer holds while it reads or rewrites the table.
+    (
+        flock 9
+        awk -v ts="$target_slot" -v tg="$target_gb" '
+            $1 == ts { printf "%d %d %s %s %d %d\n", $1, $2, $3, $4, tg, $6; next }
+            { print $0 }
+        ' "$HBM_STATE_FILE" > "${HBM_STATE_FILE}.tmp"
+        mv "${HBM_STATE_FILE}.tmp" "$HBM_STATE_FILE"
+    ) 9>>"${RUN_DIR}/hbm.lock"
+    echo "[hpu-mps] Configured default HBM quota for Slot ${target_slot} to ${target_gb} GB."
+}
+
+cmd_status() {
+    ensure_run_dir
+    ensure_hbm_state_file
+    echo "=============================================================================================="
+    echo " Gaudi2 HPU Multi-Process Service (hpu-mps)"
+    echo "=============================================================================================="
+    local ready_str="NO"
+    local slot0_is_daemon=0
+    if slot_is_locked 0 && [[ -f "$READY_FILE" ]]; then
+        local lpid rpid
+        lpid="$(slot_pid 0)"
+        rpid="$(head -n1 "$READY_FILE" 2>/dev/null | tr -d '[:space:]')"
+        if [[ -n "$lpid" && "$lpid" == "$rpid" ]]; then
+            ready_str="YES (Primary PID ${lpid})"
+        fi
+    fi
+    local global_str="DISABLED (use 'hpu-mps <cmd>' or 'hpu-mps enable-global')"
+    if is_global_preload_enabled; then
+        global_str="ENABLED (run binaries directly)"
+    fi
+    echo " Primary Bringup Ready : ${ready_str}"
+    echo " Zero-Prefix Mode      : ${global_str}"
+    echo " Interposer Library    : ${MPS_LIB}"
+    echo " Run Directory         : ${RUN_DIR}"
+    echo "----------------------------------------------------------------------------------------------"
+    printf " %-5s %-9s %-7s %-19s %-19s %-14s %s\n" \
+        "SLOT" "ROLE" "STATE" "HOST_SHARED VA" "HBM BASE VA" "HBM QUOTA" "PROCESS"
+    echo "----------------------------------------------------------------------------------------------"
+    local roles=("PRIMARY" "ATTACH-1" "ATTACH-2")
+    local host_vas=("0xfff0f80090000000" "0xfff0f80094000000" "0xfff0f80098000000")
+    local default_hbm_vas=("0x1001600150000000" "0x1001600450000000" "0x1001600d50000000")
+
+    if awk '$1 == 0 && $6 == 1 { found=1 } END { exit !found }' "$HBM_STATE_FILE" 2>/dev/null && slot_is_locked 0; then
+        slot0_is_daemon=1
+    fi
+
+    local s
+    for s in 0 1 2; do
+        local state="FREE"
+        local proc_info="-"
+        local hbm_va="${default_hbm_vas[$s]}"
+        local hbm_quota="24 GB (def)"
+        if (( slot0_is_daemon == 1 && s > 0 )); then
+            hbm_quota="36 GB (def)"
+        fi
+
+        local line
+        line="$(awk -v sl="$s" '$1 == sl { print $0 }' "$HBM_STATE_FILE" 2>/dev/null || true)"
+        if [[ -n "$line" ]]; then
+            local rec_off rec_sz rec_cfg
+            read -r _ _ rec_off rec_sz rec_cfg _ <<< "$line"
+            if [[ -n "${rec_cfg:-}" && "$rec_cfg" != "0" ]]; then
+                hbm_quota="${rec_cfg} GB (cfg)"
+            fi
+            if slot_is_locked "$s" && [[ -n "${rec_sz:-}" && "$rec_sz" != "0x0" ]]; then
+                local off_num=$(( rec_off ))
+                local base_va=$(( 0x1001600150000000 + off_num ))
+                hbm_va="$(printf "0x%016x" "$base_va")"
+                hbm_quota="$(format_hbm_bytes "$rec_sz") (act)"
+            fi
+        fi
+
+        if slot_is_locked "$s"; then
+            state="ACTIVE"
+            local pid
+            pid="$(slot_pid "$s")"
+            if [[ -n "$pid" && -r "/proc/${pid}/cmdline" ]]; then
+                local cmdline
+                cmdline="$(tr '\0' ' ' < "/proc/${pid}/cmdline" | sed 's/[[:space:]]*$//')"
+                proc_info="pid=${pid} (${cmdline:0:32})"
+            else
+                proc_info="pid=${pid:-?}"
+            fi
+        fi
+        printf " %-5s %-9s %-7s %-19s %-19s %-14s %s\n" \
+            "$s" "${roles[$s]}" "$state" "${host_vas[$s]}" "$hbm_va" "$hbm_quota" "$proc_info"
+    done
+    echo "=============================================================================================="
+}
+
+enable_global_if_root() {
+    if (( EUID == 0 )); then
+        enable_global_preload
+        echo "[hpu-mps] Zero-prefix mode enabled: run HPU programs directly."
+    else
+        echo "[hpu-mps] Not root: run HPU programs via 'hpu-mps [-m <GB>] <cmd>'."
+    fi
+}
+
+cmd_start_daemon() {
+    ensure_run_dir
+    if slot_is_locked 0; then
+        echo "[hpu-mps] Slot 0 is already active (PID $(slot_pid 0))."
+        enable_global_if_root
+        return 0
+    fi
+    if [[ ! -x "$SCAL_XFER" ]]; then
+        echo "[hpu-mps] ERROR: scal-xfer not found at ${SCAL_XFER}" >&2
+        exit 1
+    fi
+    ensure_hbm_state_file
+    rm -f "$READY_FILE"
+    local daemon_mb="${HPU_MPS_DAEMON_HBM_MB:-1536}"
+    echo "[hpu-mps] Starting background Primary daemon in Slot 0 (${daemon_mb} MB target footprint)..."
+    (umask 077 && : > "$DAEMON_LOG")
+    HPU_MPS_RUN_DIR="$RUN_DIR" HPU_MPS_DAEMON=1 HPU_MPS_SLOT=0 LD_PRELOAD="${MPS_LIB}" \
+        nohup "${SCAL_XFER}" serve </dev/null >>"$DAEMON_LOG" 2>&1 &
+    local dpid=$!
+    echo "$dpid" > "$DAEMON_PID_FILE"
+
+    local _
+    for _ in $(seq 1 150); do
+        if [[ -f "$READY_FILE" ]] && slot_is_locked 0; then
+            echo "[hpu-mps] Primary daemon ready (PID ${dpid})."
+            enable_global_if_root
+            return 0
+        fi
+        if ! kill -0 "$dpid" 2>/dev/null; then
+            echo "[hpu-mps] ERROR: Primary daemon exited prematurely. Log:" >&2
+            cat "$DAEMON_LOG" >&2 || true
+            rm -f "$DAEMON_PID_FILE"
+            exit 1
+        fi
+        sleep 0.1
+    done
+    echo "[hpu-mps] ERROR: Timed out waiting for Primary daemon readiness. Log:" >&2
+    cat "$DAEMON_LOG" >&2 || true
+    exit 1
+}
+
+wait_for_exit() {
+    local pid="$1" tries="$2" _
+    for _ in $(seq 1 "$tries"); do
+        if ! kill -0 "$pid" 2>/dev/null && ! slot_is_locked 0; then
+            return 0
+        fi
+        sleep 0.1
+    done
+    return 1
+}
+
+cmd_stop_daemon() {
+    local force=0
+    [[ "${1:-}" == "--force" || "${1:-}" == "-f" ]] && force=1
+    ensure_run_dir
+
+    # Only the process that actually holds slot 0 is a valid target: a stale
+    # daemon.pid may name an unrelated process that reused the PID.
+    local dpid=""
+    if slot_is_locked 0; then
+        dpid="$(slot_pid 0)"
+    fi
+    if [[ -z "$dpid" ]] || ! kill -0 "$dpid" 2>/dev/null; then
+        (( EUID == 0 )) && disable_global_preload
+        rm -f "$DAEMON_PID_FILE" "$READY_FILE"
+        echo "[hpu-mps] No Primary daemon is running."
+        return 0
+    fi
+
+    if secondary_slots_active && (( force == 0 )); then
+        echo "[hpu-mps] ERROR: Slot 1/2 still in use; the primary waits for them before teardown." >&2
+        echo "[hpu-mps]        Stop those programs first, or use 'hpu-mps stop --force' to kill the primary." >&2
+        exit 1
+    fi
+
+    (( EUID == 0 )) && disable_global_preload
+    if (( force == 1 )); then
+        echo "[hpu-mps] Killing Primary daemon (PID ${dpid})..."
+        kill -KILL "$dpid" 2>/dev/null || true
+    else
+        echo "[hpu-mps] Stopping Primary daemon (PID ${dpid})..."
+        kill -TERM "$dpid" 2>/dev/null || true
+    fi
+    if ! wait_for_exit "$dpid" 300; then
+        echo "[hpu-mps] ERROR: Primary daemon (PID ${dpid}) did not exit within 30 s." >&2
+        exit 1
+    fi
+    rm -f "$DAEMON_PID_FILE" "$READY_FILE"
+    echo "[hpu-mps] Primary daemon stopped."
+}
+
+usage() {
+    sed -n '4,23p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        status)
+            cmd_status
+            exit 0
+            ;;
+        top)
+            shift
+            if [[ ! -x "$MPS_TOP" ]]; then
+                echo "[hpu-mps] ERROR: hpu-mps-top not found at ${MPS_TOP}; run 'make'" >&2
+                exit 1
+            fi
+            HPU_MPS_DISABLE=1 HPU_MPS_RUN_DIR="$RUN_DIR" exec "$MPS_TOP" "$@"
+            ;;
+        start)
+            cmd_start_daemon
+            exit 0
+            ;;
+        stop)
+            shift
+            cmd_stop_daemon "${1:-}"
+            exit 0
+            ;;
+        set-mem)
+            shift
+            cmd_set_mem "${1:-}" "${2:-}"
+            exit 0
+            ;;
+        enable-global)
+            enable_global_preload
+            echo "[hpu-mps] Zero-prefix mode enabled (/etc/ld.so.preload)."
+            exit 0
+            ;;
+        disable-global)
+            disable_global_preload
+            echo "[hpu-mps] Zero-prefix mode disabled."
+            exit 0
+            ;;
+        run)
+            shift
+            ;;
+        -s|--slot)
+            if [[ ! "${2:-}" =~ ^[012]$ ]]; then
+                echo "[hpu-mps] ERROR: --slot must be 0, 1 or 2" >&2
+                exit 1
+            fi
+            export HPU_MPS_SLOT="$2"
+            shift 2
+            ;;
+        -m|--mem|--hbm-gb)
+            HPU_MPS_HBM_GB="$(parse_gb "${2:-}")"
+            export HPU_MPS_HBM_GB
+            shift 2
+            ;;
+        -q|--quiet)
+            export HPU_MPS_QUIET=1
+            shift
+            ;;
+        -h|--help|help)
+            usage
+            exit 0
+            ;;
+        --)
+            shift
+            break
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
+if [[ $# -eq 0 ]]; then
+    usage
+    exit 1
+fi
+
+ensure_run_dir
+export HPU_MPS_RUN_DIR="$RUN_DIR"
+if ! is_global_preload_enabled; then
+    export LD_PRELOAD="${MPS_LIB}${LD_PRELOAD:+:${LD_PRELOAD}}"
+fi
+
+exec "$@"
